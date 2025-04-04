@@ -1,0 +1,210 @@
+---
+title: "457 project"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+#Install Packages
+library(dplyr)
+library(readr)
+library(tidyverse)
+library(astsa)
+library(lubridate)
+library(scales)
+
+Daily_Prices_ICCO <- read_csv("Daily Prices_ICCO.csv")
+climate_data <- read_csv("Ghana_data.csv")
+delta_max <- mean(climate_data$TMAX - climate_data$TAVG, na.rm = TRUE)
+delta_min <- mean(climate_data$TAVG - climate_data$TMIN, na.rm = TRUE)
+climate_data <- climate_data %>%
+  mutate(
+    TMAX = ifelse(is.na(TMAX), TAVG + delta_max, TMAX),
+    TMIN = ifelse(is.na(TMIN), TAVG - delta_min, TMIN)
+  )
+```
+
+```{r}
+climate_data %>%
+  mutate(Month = month(DATE, label = TRUE)) %>%
+  ggplot(aes(x = Month, y = TAVG)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "Monthly Distribution of Average Temperature", y = "TAVG (°F)") +
+  theme_minimal()
+```
+
+```{r}
+# Cleaning Data
+Daily_Prices_ICCO <- Daily_Prices_ICCO %>%
+  mutate(Date = dmy(Date),
+         Price = as.numeric(gsub(",", "", `ICCO daily price (US$/tonne)`))) %>%
+           arrange(Date)
+
+# BoxPlot for Daily Price
+# Extract year
+Daily_Prices_ICCO$Year <- year(Daily_Prices_ICCO$Date)
+min_year <- min(Daily_Prices_ICCO$Year)
+max_year <- max(Daily_Prices_ICCO$Year)
+mid_year <- floor((min_year + max_year) / 2)
+
+# Create Half Group
+Daily_Prices_ICCO$Half <- case_when(
+  Daily_Prices_ICCO$Year <= mid_year ~ paste0(min_year, "–", mid_year),
+  Daily_Prices_ICCO$Year > mid_year ~ paste0((mid_year + 1), "–", max_year)
+)
+Daily_Prices_ICCO$Year <- as.factor(Daily_Prices_ICCO$Year)
+
+# Plot
+ggplot(Daily_Prices_ICCO, aes(x = Year, y = Price)) +
+  geom_boxplot(fill = "lightblue", color = "darkblue", outlier.size = 0.8) +
+  labs(title = "ICCO Daily Prices by Year (Split into Two Halves)",
+       x = "Year",
+       y = "Price (US$/tonne)") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 8),
+    strip.text = element_text(face = "bold", size = 12),
+    plot.title = element_text(face = "bold", size = 16)
+  ) +
+  facet_wrap(~ Half, scales = "free_x")
+
+# Trend Plot
+Daily_Prices_ICCO %>%
+  ggplot(aes(x= Date, y = Price))+
+  geom_line()
+```
+
+
+```{r, include=FALSE}
+Diff <- log(Daily_Prices_ICCO$Price) - log(lag(Daily_Prices_ICCO$Price))
+Daily_Prices_ICCO_Diff <- Daily_Prices_ICCO %>%
+  mutate(Diff) %>%
+  drop_na()
+Daily_Prices_ICCO_Diff %>%
+  ggplot(aes(x = Date, y= Diff))+
+  geom_line()
+```
+
+
+```{r}
+climate_data <- climate_data %>%
+  mutate(PRCP = replace_na(PRCP,0),
+         DATE = ymd(DATE))
+
+climate_date_new <- climate_data %>%
+  group_by(DATE) %>%
+  summarise(
+    total_PRCP = sum(PRCP, na.rm = TRUE),
+    sum_TAVG = sum(TAVG, na.rm = TRUE),
+    sum_TMAX = sum(TMAX, na.rm = TRUE),
+    sum_TMIN = sum(TMIN, na.rm = TRUE)
+  )
+```
+
+```{r}
+library(forecast)
+library(ggplot2)
+
+combine_data <- Daily_Prices_ICCO_Diff %>%
+  inner_join(climate_date_new,
+             by = c("Date" = "DATE"))
+```
+
+
+```{r}
+train_data <- combine_data %>% filter(Date < as.Date("2024-06-01"))
+test_data  <- combine_data %>% filter(Date >= as.Date("2024-06-01"))
+acf2(Diff, max.lag = 20, main = "ACF and PACF for SARIMA Model")
+```
+
+```{r}
+ts_diff <- ts(train_data$Diff, frequency = 365)
+sarima_model <- Arima(ts_diff,
+                      order = c(1, 0, 1))
+forecast_horizon <- nrow(test_data) + 730
+forecast_result <- forecast(sarima_model, h = forecast_horizon)
+
+# Reconstruct price from log-diffs
+last_price <- tail(train_data$Price, 1)
+log_returns_cumsum <- cumsum(forecast_result$mean)
+forecast_price <- last_price * exp(log_returns_cumsum)
+forecast_dates <- seq.Date(from = as.Date("2024-06-01"), by = "day", length.out = forecast_horizon)
+forecast_df <- data.frame(Date = forecast_dates, Forecast_Price = forecast_price)
+
+actual_df <- combine_data %>% filter(Date <= as.Date("2024-11-28"))
+
+# Plot
+ggplot() +
+  geom_line(data = actual_df, aes(x = Date, y = Price), color = "black") +
+  geom_line(data = forecast_df, aes(x = Date, y = Forecast_Price), color = "blue") +
+  labs(title = "Combination of Actual Price and Sarima Forecast for Future Prices",
+       y = "Price (USD/tonne)", x = "Date") +
+  theme_minimal()
+
+# Load necessary package
+library(Metrics)
+forecast_test_period <- forecast_df %>%
+  filter(Date >= as.Date("2024-06-01") & Date <= as.Date("2024-11-28"))
+
+actual_prices <- test_data$Price
+predicted_prices <- forecast_test_period$Forecast_Price[1:length(actual_prices)]
+
+rmse_val <- rmse(actual_prices, predicted_prices)
+cat("RMSE for SARIMA Forecast:", round(rmse_val, 2), "\n")
+
+```
+
+
+```{r}
+# ETS Model
+# Convert log prices from training set into ts object
+log_price_ts <- ts(log(train_data$Price), frequency = 365)
+
+# Fit ETS model on log prices
+log_price_ts <- ts(log(train_data$Price), frequency = 365)
+
+# STL + ETS forecast for seasonal data
+stlf_forecast_log <- stlf(log_price_ts, h = nrow(test_data), method = "ets")
+
+# Back-transform
+price_forecast <- exp(stlf_forecast_log$mean)
+
+
+# Build a forecast dataframe for plotting
+forecast_df <- data.frame(
+  Date = test_data$Date,
+  Forecast_Price = price_forecast
+)
+
+# Combine with full price history
+full_data <- rbind(
+  train_data %>% select(Date, Price),
+  test_data %>% select(Date, Price)
+)
+
+# Plot actual prices with ETS forecast
+ggplot(full_data, aes(x = Date, y = Price)) +
+  geom_line(color = "black") +
+  geom_line(data = forecast_df, aes(x = Date, y = Forecast_Price), color = "purple", linewidth = 1) +
+  ggtitle("Model Forecasts vs Actual Prices") +
+  ylab("Price") + xlab("Date")
+
+# Evaluation Metrics
+library(Metrics)
+
+actual_prices <- test_data$Price
+predicted_prices <- as.numeric(price_forecast)
+
+rmse_val <- rmse(actual_prices, predicted_prices)
+mae_val <- mae(actual_prices, predicted_prices)
+mape_val <- mape(actual_prices, predicted_prices) * 100
+
+cat("Forecast Evaluation Metrics (ETS Model):\n")
+cat("Train/Test Split: Before 2024-06-01 / From 2024-06-01\n")
+cat("RMSE:", round(rmse_val, 2), "\n")
+cat("MAE :", round(mae_val, 2), "\n")
+cat("MAPE:", round(mape_val, 2), "%\n")
+```
+
+
